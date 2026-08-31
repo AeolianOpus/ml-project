@@ -1,0 +1,5 @@
+,Accuracy,Macro F1,Macro ROC-AUC,Macro PR-AUC
+RF (val),0.5727,0.5971,0.9359,0.6227
+CNN+aug (val),0.6453,0.6696,0.9644,0.7177
+RF (test),0.5408,0.5549,0.9184,0.5898
+CNN+aug (test),0.6326,0.6486,0.9464,0.6864
