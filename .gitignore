@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Environment secrets
+.env
+
+# ML project specific — DO NOT PUSH THESE
+data/
+models/*.h5
+models/*.keras
+models/*.pth
+models/*.pt
+models/*.joblib
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Streamlit
+.streamlit/secrets.toml
