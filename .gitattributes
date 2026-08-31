@@ -1,0 +1,21 @@
+* text=auto eol=lf
+*.ipynb text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary — don't touch
+*.wav binary
+*.npy binary
+*.parquet binary
+*.h5 binary
+*.keras binary
+*.pt binary
+*.pth binary
+*.joblib binary
+*.png binary
+*.jpg binary
+*.pdf binary
