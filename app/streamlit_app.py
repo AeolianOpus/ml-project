@@ -12,6 +12,8 @@ import streamlit as st
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import warnings
+warnings.filterwarnings("ignore", message="n_fft=.* is too large")
 
 # ==== CONFIG ====
 
@@ -119,6 +121,77 @@ def predict_all_windows(model: ChordCNN, audio: np.ndarray) -> np.ndarray:
         pos += HOP_SAMPLES
     return np.stack(all_probs)
 
+# ==== KEY DETECTION ====
+
+# Weight vectors — how much each pitch class is emphasized in a key
+# Krumhansl-Schmuckler-inspired: tonic gets highest weight, then perfect 5th, 3rd, etc.
+MAJOR_KEY_PROFILE = np.array([
+    6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+    2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
+])
+MINOR_KEY_PROFILE = np.array([
+    6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+    2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
+])
+
+
+def detect_key(pitch_class_energy: np.ndarray) -> tuple[str, str, float]:
+    """
+    Given a 12-dim pitch-class energy vector, return (root, mode, confidence).
+    mode is "major" or "minor". confidence is the correlation with the winning key profile.
+    """
+    best_root = 0
+    best_mode = "major"
+    best_score = -np.inf
+
+    # Try all 12 major keys and 12 minor keys — rotate the profile
+    for root in range(12):
+        for mode, profile in [("major", MAJOR_KEY_PROFILE), ("minor", MINOR_KEY_PROFILE)]:
+            rotated = np.roll(profile, root)
+            # Correlation between rotated profile and observed pitch energy
+            score = float(np.corrcoef(rotated, pitch_class_energy)[0, 1])
+            if score > best_score:
+                best_score = score
+                best_root = root
+                best_mode = mode
+
+    return PITCH_CLASSES[best_root], best_mode, best_score
+
+
+def class_predictions_to_pitch_energy(
+    predictions: np.ndarray,
+    confidences: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """
+    Convert per-window class predictions into a 12-dim pitch-class energy vector.
+    Each high-confidence prediction contributes to its constituent pitch classes,
+    weighted by its confidence.
+    """
+    energy = np.zeros(12, dtype=np.float32)
+    for cid, conf in zip(predictions, confidences):
+        if conf < threshold:
+            continue
+        cid = int(cid)
+        if cid == 36:  # silence — contributes nothing
+            continue
+        if cid < 12:  # single note — full contribution to its pitch class
+            energy[cid] += conf
+        elif cid < 24:  # major triad — root + major 3rd + perfect 5th
+            root = cid - 12
+            energy[root] += conf
+            energy[(root + 4) % 12] += conf * 0.6
+            energy[(root + 7) % 12] += conf * 0.8
+        else:  # minor triad — root + minor 3rd + perfect 5th
+            root = cid - 24
+            energy[root] += conf
+            energy[(root + 3) % 12] += conf * 0.6
+            energy[(root + 7) % 12] += conf * 0.8
+
+    # Normalize so absolute confidence doesn't matter, just the profile shape
+    if energy.sum() > 0:
+        energy = energy / energy.sum()
+    return energy
 
 # ==== UI ====
 
@@ -154,29 +227,71 @@ with st.sidebar:
     )
 
 
-# --- File upload + processing ---
-uploaded = st.file_uploader(
-    "Upload a guitar audio file",
-    type=["wav", "mp3", "flac", "ogg"],
-)
+import io
 
-if uploaded is None:
-    st.info("👆 Upload an audio file to get started.")
+# --- Sample files for quick demo ---
+DEMO_SAMPLES = {
+    "🎸 Chord playing (Eb Bossa Nova)": "00_BN1-129-Eb_comp_mic.wav",
+    "🎵 Solo melody (C# Rock)": "01_Rock1-90-C#_solo_mic.wav",
+    "🎼 Chord playing (C Jazz)": None,  # will find dynamically below
+}
+
+# Try to locate a jazz comp file automatically
+AUDIO_SAMPLES_DIR = PROJECT_ROOT / "data" / "guitarset" / "audio_mono-mic"
+jazz_candidates = list(AUDIO_SAMPLES_DIR.glob("*_Jazz*_comp_mic.wav"))
+if jazz_candidates:
+    DEMO_SAMPLES["🎼 Chord playing (Jazz)"] = jazz_candidates[0].name
+    DEMO_SAMPLES.pop("🎼 Chord playing (C Jazz)")
+else:
+    DEMO_SAMPLES.pop("🎼 Chord playing (C Jazz)")
+
+
+st.markdown("### Choose an audio source")
+
+tab_upload, tab_demo = st.tabs(["📁 Upload your own", "⚡ Try a demo file"])
+
+audio_bytes: bytes | None = None
+source_name: str = ""
+
+with tab_upload:
+    uploaded = st.file_uploader(
+        "Drop a .wav / .mp3 / .flac / .ogg file",
+        type=["wav", "mp3", "flac", "ogg"],
+    )
+    if uploaded is not None:
+        audio_bytes = uploaded.read()
+        source_name = uploaded.name
+
+with tab_demo:
+    st.caption("Instantly load a file from GuitarSet — no upload needed.")
+    cols = st.columns(len(DEMO_SAMPLES))
+    for col, (label, filename) in zip(cols, DEMO_SAMPLES.items()):
+        with col:
+            if st.button(label, use_container_width=True):
+                sample_path = AUDIO_SAMPLES_DIR / filename
+                if sample_path.exists():
+                    audio_bytes = sample_path.read_bytes()
+                    source_name = filename
+                    st.success(f"Loaded {filename}")
+                else:
+                    st.error(f"Sample file not found: {sample_path}")
+
+
+if audio_bytes is None:
+    st.info("👆 Upload a file or click a demo button to get started.")
     st.stop()
 
 # Load audio
-with st.spinner("Loading and processing audio..."):
-    audio_bytes = uploaded.read()
-    # librosa.load supports file-like objects
-    import io
+with st.spinner(f"Loading and processing {source_name}..."):
     y, _ = librosa.load(io.BytesIO(audio_bytes), sr=SR, mono=True)
 
 duration = len(y) / SR
+st.markdown(f"### Now analyzing: `{source_name}`")
 st.audio(audio_bytes)
-st.write(
-    f"**Duration:** {duration:.2f} s  |  "
-    f"**Samples:** {len(y):,}  |  "
-    f"**Sample rate:** {SR} Hz"
+st.caption(
+    f"Duration: **{duration:.2f} s**  •  "
+    f"Samples: **{len(y):,}**  •  "
+    f"Sample rate: **{SR} Hz**"
 )
 
 # Run predictions across all windows
@@ -188,7 +303,7 @@ times = np.arange(len(all_probs)) * HOP_SEC
 # --- Mode selector ---
 mode = st.radio(
     "Analysis mode",
-    ["Whole file (average) — best for held chords", "Segment-by-segment — best for solos and progressions"],
+    ["Segment-by-segment — best for solos and progressions", "Whole file (average) — best for held chords"],
     horizontal=True,
 )
 
@@ -282,11 +397,35 @@ else:
     class_counter = Counter(int(c) for c in high_conf_classes)
     n_high_conf = int(high_conf_mask.sum())
 
-    st.write(
-        f"**{n_high_conf}/{len(all_probs)} windows** above confidence threshold "
-        f"({threshold:.0%}). "
-        f"**{len(class_counter)}** distinct classes detected."
-    )
+    # Split into two columns — left: stats, right: key detection
+    stat_col, key_col = st.columns([1, 1])
+
+    with stat_col:
+        st.metric("High-confidence windows", f"{n_high_conf} / {len(all_probs)}")
+        st.metric("Distinct classes detected", f"{len(class_counter)}")
+
+    with key_col:
+        # Derive the likely key from all high-confidence predictions
+        pitch_energy = class_predictions_to_pitch_energy(
+            predictions_per_window, confidences_per_window, threshold
+        )
+
+        if pitch_energy.sum() > 0:
+            key_root, key_mode, key_conf = detect_key(pitch_energy)
+            key_symbol = "🎼"
+            st.metric(
+                f"{key_symbol}  Likely key",
+                f"{key_root} {key_mode}",
+                delta=f"correlation {key_conf:+.2f}",
+                delta_color="off",
+            )
+            st.caption(
+                "Derived from high-confidence predictions using Krumhansl-style key profiles. "
+                "This is *not* a model output — it's downstream analysis."
+            )
+        else:
+            st.metric("🎼 Likely key", "—")
+            st.caption("Not enough high-confidence data to detect a key.")
 
     if class_counter:
         counts_df = [
