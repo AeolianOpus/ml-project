@@ -12,10 +12,19 @@ import streamlit as st
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import queue
+import time
+import sounddevice as sd
 import warnings
 warnings.filterwarnings("ignore", message="n_fft=.* is too large")
 
 # ==== CONFIG ====
+# Live audio config (Helix via DirectSound Primary Capture)
+LIVE_DEVICE = 6              # confirmed working — stereo, 0.43 max amplitude
+LIVE_SR_NATIVE = 48000
+LIVE_CHANNELS = 2            # stereo, averaged to mono internally
+LIVE_BLOCK_MS = 100
+
 
 SR = 22050
 WINDOW_SEC = 0.5
@@ -27,7 +36,7 @@ N_BINS = 84
 BINS_PER_OCTAVE = 12
 CQT_HOP_LENGTH = 512
 
-PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+PITCH_CLASSES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 CLASS_NAMES: list[str] = (
     [f"note:{p}" for p in PITCH_CLASSES]
     + [f"maj:{p}" for p in PITCH_CLASSES]
@@ -121,6 +130,123 @@ def predict_all_windows(model: ChordCNN, audio: np.ndarray) -> np.ndarray:
         pos += HOP_SAMPLES
     return np.stack(all_probs)
 
+
+def _start_live_audio() -> None:
+    """Start the audio input stream. Stored in session_state to survive reruns."""
+    if st.session_state.get("live_stream") is not None:
+        return
+
+    audio_queue: queue.Queue = queue.Queue()
+    audio_buffer = np.zeros(int(LIVE_SR_NATIVE * WINDOW_SEC), dtype=np.float32)
+
+    def callback(indata, frames, time_info, status):
+        audio_queue.put(indata.mean(axis=1).copy())
+
+    block_size = int(LIVE_SR_NATIVE * LIVE_BLOCK_MS / 1000)
+    stream = sd.InputStream(
+        device=LIVE_DEVICE,
+        samplerate=LIVE_SR_NATIVE,
+        channels=LIVE_CHANNELS,
+        blocksize=block_size,
+        dtype="float32",
+        callback=callback,
+    )
+    stream.start()
+
+    st.session_state.live_stream = stream
+    st.session_state.live_queue = audio_queue
+    st.session_state.live_buffer = audio_buffer
+
+
+def _stop_live_audio() -> None:
+    stream = st.session_state.get("live_stream")
+    if stream is not None:
+        stream.stop()
+        stream.close()
+    st.session_state.live_stream = None
+    st.session_state.live_queue = None
+    st.session_state.live_buffer = None
+
+
+def render_live_mode(cnn_model) -> None:
+    """Live capture from Helix — continuous inference, no file needed."""
+    _start_live_audio()
+
+    top1, top2 = st.columns([4, 1])
+    with top1:
+        st.markdown("## 🔴 LIVE — reading from Helix")
+    with top2:
+        if st.button("■  STOP", use_container_width=True):
+            _stop_live_audio()
+            st.session_state.live_mode = False
+            st.rerun()
+
+    st.caption(f"Device {LIVE_DEVICE} · {LIVE_SR_NATIVE} Hz · stereo→mono · updates every 250 ms")
+
+    # Drain audio queue into rolling buffer
+    if st.session_state.live_queue is not None and st.session_state.live_buffer is not None:
+        while not st.session_state.live_queue.empty():
+            try:
+                chunk = st.session_state.live_queue.get_nowait()
+                n = len(chunk)
+                buf = st.session_state.live_buffer
+                buf = np.roll(buf, -n)
+                buf[-n:] = chunk
+                st.session_state.live_buffer = buf  # write back!
+            except queue.Empty:
+                break
+
+    # Init prediction history
+    if "live_history" not in st.session_state:
+        st.session_state.live_history = []
+
+    # Run inference on the current buffer
+    if st.session_state.live_buffer is not None:
+        resampled = librosa.resample(st.session_state.live_buffer, orig_sr=LIVE_SR_NATIVE, target_sr=SR)
+        if len(resampled) >= WINDOW_SAMPLES:
+            window = resampled[-WINDOW_SAMPLES:]
+            signal_amp = float(np.abs(window).max())
+            probs = predict_window(cnn_model, window)
+            top_idx = int(np.argmax(probs))
+            top_conf = float(probs[top_idx])
+            top_label = CLASS_NAMES[top_idx]
+
+            st.session_state.live_history.append((top_label, top_conf, signal_amp))
+            if len(st.session_state.live_history) > 30:
+                st.session_state.live_history = st.session_state.live_history[-30:]
+
+            # Big prediction display
+            display = top_label if signal_amp > 0.01 else "— quiet —"
+            color = "#4caf50" if top_conf > 0.5 else "#ff9800" if top_conf > 0.3 else "#666"
+            st.markdown(
+                f"<div style='text-align:center; padding:40px; background:#0f0f0f; "
+                f"border:2px solid #333; border-radius:16px; margin:20px 0;'>"
+                f"<h1 style='color:{color}; font-size:120px; margin:0; font-family:Georgia,serif;'>"
+                f"{display}</h1>"
+                f"<p style='color:#888; font-size:14px; margin-top:12px;'>"
+                f"signal {signal_amp:.3f} · confidence {top_conf:.1%}</p></div>",
+                unsafe_allow_html=True,
+            )
+            st.progress(min(top_conf, 1.0))
+            # Fun message when confidence is low (model is confused)
+            recent = st.session_state.live_history[-4:]
+            if len(recent) >= 4:
+                avg_conf = np.mean([conf for _, conf, _ in recent])
+                avg_amp = np.mean([amp for _, _, amp in recent])
+                # Playing (signal present) but model unsure = too fast/complex
+                if avg_amp > 0.05 and avg_conf < 0.35:
+                    st.markdown(
+                        "<div style='text-align:center; font-size:22px; color:#ff9800; "
+                        "font-family:Georgia,serif; font-style:italic; margin-top:20px;'>"
+                        "🔥 slow down tiger! 🔥</div>",
+                        unsafe_allow_html=True,
+                    )
+
+            
+    # Auto-refresh every 250ms — Streamlit's proper way
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=250, key="live_refresh")
+
 # ==== KEY DETECTION ====
 
 # Weight vectors — how much each pitch class is emphasized in a key
@@ -208,6 +334,42 @@ st.markdown(
     "37 classes: 12 single notes + 12 major triads + 12 minor triads + silence."
 )
 
+# Init session state for live mode
+if "live_mode" not in st.session_state:
+    st.session_state.live_mode = False
+
+# Big red LIVE button — CSS
+st.markdown("""
+<style>
+div.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #ff1744 0%, #b71c1c 100%);
+    color: white !important;
+    font-size: 28px !important;
+    font-weight: 900 !important;
+    padding: 28px 40px !important;
+    border-radius: 16px !important;
+    border: 3px solid #ff8080 !important;
+    box-shadow: 0 0 30px rgba(255,23,68,0.6), 0 4px 20px rgba(0,0,0,0.3),
+                inset 0 -4px 12px rgba(0,0,0,0.2) !important;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    animation: pulse-live 1.8s ease-in-out infinite;
+    transition: all 0.2s ease;
+}
+div.stButton > button[kind="primary"]:hover {
+    transform: translateY(-3px) scale(1.02);
+    box-shadow: 0 0 50px rgba(255,23,68,0.95), 0 8px 30px rgba(0,0,0,0.4),
+                inset 0 -4px 12px rgba(0,0,0,0.2) !important;
+}
+@keyframes pulse-live {
+    0%, 100% { box-shadow: 0 0 30px rgba(255,23,68,0.6), 0 4px 20px rgba(0,0,0,0.3),
+               inset 0 -4px 12px rgba(0,0,0,0.2); }
+    50%      { box-shadow: 0 0 50px rgba(255,23,68,1.0), 0 4px 20px rgba(0,0,0,0.3),
+               inset 0 -4px 12px rgba(0,0,0,0.2); }
+}
+</style>
+""", unsafe_allow_html=True)
+
 # --- Sidebar with info + model status ---
 model = load_model()
 with st.sidebar:
@@ -225,6 +387,20 @@ with st.sidebar:
         "3. Best results: mono acoustic-style guitar,\n"
         "   clean tone, isolated chord or note"
     )
+    
+# Route into live mode if active — hides all file-mode UI
+if st.session_state.live_mode:
+    render_live_mode(model)
+    st.stop()
+
+# GO LIVE button — shown when in file mode
+col_left, col_center, col_right = st.columns([1, 2, 1])
+with col_center:
+    if st.button("⚡  GO LIVE FROM HELIX  ⚡", type="primary", use_container_width=True):
+        st.session_state.live_mode = True
+        st.rerun()
+
+st.markdown("---")
 
 
 import io
