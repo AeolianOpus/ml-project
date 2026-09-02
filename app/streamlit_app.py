@@ -181,8 +181,19 @@ def render_live_mode(cnn_model) -> None:
             st.session_state.live_mode = False
             st.rerun()
 
-    st.caption(f"Device {LIVE_DEVICE} · {LIVE_SR_NATIVE} Hz · stereo→mono · updates every 250 ms")
+    st.caption(f"Device {LIVE_DEVICE} · {LIVE_SR_NATIVE} Hz · stereo→mono · updates every 500 ms")
 
+    # Init prediction history
+    if "live_history" not in st.session_state:
+        st.session_state.live_history = []
+
+    # Fragment: only this rerurns, not the whole page → no more gray-out
+    _live_inference_fragment(cnn_model)
+
+
+@st.fragment(run_every=0.5)
+def _live_inference_fragment(cnn_model) -> None:
+    """Runs every 500ms without triggering a full page rerun."""
     # Drain audio queue into rolling buffer
     if st.session_state.live_queue is not None and st.session_state.live_buffer is not None:
         while not st.session_state.live_queue.empty():
@@ -192,15 +203,10 @@ def render_live_mode(cnn_model) -> None:
                 buf = st.session_state.live_buffer
                 buf = np.roll(buf, -n)
                 buf[-n:] = chunk
-                st.session_state.live_buffer = buf  # write back!
+                st.session_state.live_buffer = buf
             except queue.Empty:
                 break
 
-    # Init prediction history
-    if "live_history" not in st.session_state:
-        st.session_state.live_history = []
-
-    # Run inference on the current buffer
     if st.session_state.live_buffer is not None:
         resampled = librosa.resample(st.session_state.live_buffer, orig_sr=LIVE_SR_NATIVE, target_sr=SR)
         if len(resampled) >= WINDOW_SAMPLES:
@@ -215,7 +221,6 @@ def render_live_mode(cnn_model) -> None:
             if len(st.session_state.live_history) > 30:
                 st.session_state.live_history = st.session_state.live_history[-30:]
 
-            # Big prediction display
             display = top_label if signal_amp > 0.01 else "— quiet —"
             color = "#4caf50" if top_conf > 0.5 else "#ff9800" if top_conf > 0.3 else "#666"
             st.markdown(
@@ -228,12 +233,12 @@ def render_live_mode(cnn_model) -> None:
                 unsafe_allow_html=True,
             )
             st.progress(min(top_conf, 1.0))
-            # Fun message when confidence is low (model is confused)
+
+            # Fun message when confidence is low
             recent = st.session_state.live_history[-4:]
             if len(recent) >= 4:
                 avg_conf = np.mean([conf for _, conf, _ in recent])
                 avg_amp = np.mean([amp for _, _, amp in recent])
-                # Playing (signal present) but model unsure = too fast/complex
                 if avg_amp > 0.05 and avg_conf < 0.35:
                     st.markdown(
                         "<div style='text-align:center; font-size:22px; color:#ff9800; "
@@ -241,11 +246,6 @@ def render_live_mode(cnn_model) -> None:
                         "🔥 slow down tiger! 🔥</div>",
                         unsafe_allow_html=True,
                     )
-
-            
-    # Auto-refresh every 250ms — Streamlit's proper way
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=250, key="live_refresh")
 
 # ==== KEY DETECTION ====
 
